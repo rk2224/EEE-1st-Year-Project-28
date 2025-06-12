@@ -1,0 +1,226 @@
+/*****************************************************************
+  SeaBoat Dual-Mode + UI + Unmodified Sensor Block
+  Board : Adafruit Metro M0 Express + WINC1500  |  WiFi101 v0.16.1
+*****************************************************************/
+#include <SPI.h>
+#include <WiFi101.h>
+#include <WiFiUdp.h>
+
+/* ---------- Wi-Fi & motors (kept identical) ---------- */
+#define WINC_CS  10
+#define WINC_IRQ  7
+#define WINC_RST  5
+const char AP_SSID[]   = "SeaBoat_AP";
+const char AP_PASS[]   = "12345678";
+const byte AP_CHANNEL  = 6;
+const int  DIR_L = 4, EN_L = 6;
+const int  DIR_R = 8, EN_R = 9;
+WiFiServer httpSrv(80);
+WiFiUDP    udp;
+const uint16_t UDP_PORT = 4210;
+
+/* ============  YOUR SENSOR CODE (verbatim)  ============ */
+// IR on A3 (analogue threshold)
+const int analogPin = A3;
+const float thresholdVoltage = 2.5;
+const unsigned long sampleInterval = 1;
+const unsigned long debounceMsAnalog = 2;
+unsigned long lastSampleTimeAnalog = 0, lastPulseTimeAnalog = 0;
+unsigned long pulseCountAnalog = 0;
+bool lastAboveThreshold = false;
+
+// RF on A0 (interrupt, falling)
+const int digitalPin = A0;
+volatile unsigned long pulseCountDigital = 0;
+const unsigned long debounceUsDigital = 100;
+volatile unsigned long lastPulseTimeDigital = 0;
+
+// Hall on A1
+const int hallPin = A1;
+const int sampleCount = 10;
+const float hallThreshold = 50.0;
+const float alpha = 0.2;
+float filteredValue = 0, baseline = 0;
+const float gain = 2.0;
+
+// timers
+unsigned long lastDisplayTime = 0;
+const unsigned long displayInterval = 1000;
+unsigned long lastMagReadTime = 0;
+const unsigned long magReadInterval = 200;
+
+/* ---------- live values pushed to UI ---------- */
+float IR_Hz = 0, RF_Hz = 0; String MAG = "NONE"; String TAG="----";
+
+/* ---------- UART tag (still optional) ---------- */
+char tagBuf[5]; int tagIdx=0; bool collecting=false;
+
+/* ============  Fancy UI page (unchanged) ============ */
+const char page[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang=en><head><meta charset=UTF-8><meta name=viewport content="width=device-width,initial-scale=1.0"><title>EEESeaBoat</title><style>:root{--a:#3A86FF;--b:#0b0c10;--c:#1f2937;--d:#f8f8f2;--e:#9ca3af;--f:#374151;--g:#00ffcc}*{box-sizing:border-box;margin:0;padding:0}body{font-family:sans-serif;background:var(--b);color:var(--d);padding:40px 20px}h1{font-size:2.2rem;text-align:center;margin-bottom:30px;color:var(--g)}.d{max-width:1100px;margin:auto;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}.c{background:var(--c);border:1px solid var(--f);border-radius:14px;padding:18px;box-shadow:0 4px 10px rgba(0,0,0,.35);display:flex;flex-direction:column;gap:12px}.c h2{font-size:1.15rem;color:var(--g)}.btn{padding:10px 18px;border:0;border-radius:8px;background:linear-gradient(90deg,var(--a),var(--g));color:#000;font-weight:700;cursor:pointer;transition:transform .15s}.btn:hover{transform:scale(1.05)}.s,.r{padding:10px;background:#111827;border:1px solid var(--f);border-radius:6px;font-weight:600;text-align:center}.sg{display:flex;justify-content:space-between;align-items:center}.sl{font-weight:600}.si{width:90px;padding:6px;text-align:center;border:none;border-radius:5px;background:var(--b);color:var(--g);font-weight:700}.t{width:100%;border-collapse:collapse;font-size:.9rem;margin-top:16px}.t th,.t td{padding:8px;border-bottom:1px solid var(--f)}.t th{color:var(--e);text-align:left}.ctl{text-align:center;margin-top:32px}.k{display:inline-block;margin:4px;padding:8px 16px;background:var(--c);border:1px solid var(--f);border-radius:6px;font-weight:700;color:var(--g)}</style></head><body><h1>EEESeaBoat Control</h1><div class=d><div class=c><h2>LED Control</h2><button class=btn onclick=lo()>ON</button><button class=btn onclick=lf()>OFF</button><div class=s id=lSt>LED OFF</div></div><div class=c><h2>Ultrasonic Duck Name</h2><div class=sg><label class=sl>UART:</label><input class=si id=uIn maxlength=4 oninput=dn()></div><div class=r id=dnR>Name: N/A</div></div><div class=c><h2>Species Detection</h2><div class=sg><label class=sl>IR(Hz):</label><input class=si id=ir type=number oninput=sp()></div><div class=sg><label class=sl>RF(Hz):</label><input class=si id=rf type=number oninput=sp()></div><div class=sg><label class=sl>Mag:</label><input class=si id=mg placeholder="up/down" oninput=sp()></div><div class=s id=iSt>IR: N/A</div><div class=s id=rSt>RF: N/A</div><div class=s id=mSt>Polarity: N/A</div><div class=r id=spR>Species: ?</div><table class=t><thead><tr><th>IR</th><th>RF</th><th>Pol</th><th>Species</th></tr></thead><tbody><tr><td>457</td><td>-</td><td>down</td><td>Wibbo</td></tr><tr><td>-</td><td>100</td><td>down</td><td>Gribbit</td></tr><tr><td>293</td><td>-</td><td>up</td><td>Snorkle</td></tr><tr><td>-</td><td>150</td><td>up</td><td>Zapple</td></tr></tbody></table></div></div><div class=ctl><h2>Movement (W A S D)</h2><p><span class=k>W</span><span class=k>A</span><span class=k>S</span><span class=k>D</span></p><div class=s id=mv>Awaiting…</div></div><script>const f=s=>fetch('/?c='+s,{keepalive:1}).catch(()=>{});function lo(){f('O');lSt.textContent='LED ON'}function lf(){f('o');lSt.textContent='LED OFF'}function dn(){const v=uIn.value;dnR.textContent=v.length==4?'Name: '+v:'Name: N/A'}function sp(){const irv=parseInt(ir.value),rfv=parseInt(rf.value),mgv=mg.value.trim().toLowerCase();let s='?';if(irv==457&&mgv=='down')s='Wibbo';else if(rfv==100&&mgv=='down')s='Gribbit';else if(irv==293&&mgv=='up')s='Snorkle';else if(rfv==150&&mgv=='up')s='Zapple';iSt.textContent=irv?'IR:'+irv:'IR: N/A';rSt.textContent=rfv?'RF:'+rfv:'RF: N/A';mSt.textContent='Polarity:'+ (mgv||'N/A');spR.textContent='Species: '+s}document.addEventListener('keydown',e=>{if(e.repeat)return;let c='';switch(e.key.toLowerCase()){case'w':mv.textContent='Forward';c='F';break;case'a':mv.textContent='Left';c='L';break;case's':mv.textContent='Back';c='B';break;case'd':mv.textContent='Right';c='R';break;default:return;}f(c)});document.addEventListener('keyup',e=>{if(['w','a','s','d'].includes(e.key.toLowerCase())){mv.textContent='Stopped';f('S')}});setInterval(()=>fetch('/data')
+  .then(r=>r.json())
+  .then(j=>{
+    iSt.textContent = 'IR: ' + j.ir + ' Hz';
+    rSt.textContent = 'RF: ' + j.rf + ' Hz';
+    mSt.textContent = 'Polarity: ' + j.mag;
+    dnR.textContent = 'Name: ' + j.tag;
+  }), 1000);</script></body></html>
+)HTML";
+const uint16_t PAGE_LEN = sizeof(page)-1;
+
+/* ---------- chunk sender ---------- */
+void sendPage(WiFiClient& c){
+  const uint16_t CH=256;
+  for(uint16_t o=0;o<PAGE_LEN;o+=CH)
+    c.write(page+o,(PAGE_LEN-o>CH)?CH:PAGE_LEN-o);
+}
+
+/* ---------- setup ---------- */
+void setup(){
+  Serial.begin(115200);
+  Serial1.begin(600);
+
+  pinMode(DIR_L,OUTPUT); pinMode(EN_L,OUTPUT);
+  pinMode(DIR_R,OUTPUT); pinMode(EN_R,OUTPUT);
+  pinMode(LED_BUILTIN,OUTPUT);
+
+  pinMode(analogPin,INPUT);
+  pinMode(digitalPin,INPUT_PULLUP);
+  pinMode(hallPin,INPUT);
+  attachInterrupt(digitalPinToInterrupt(digitalPin), countPulseDigital, FALLING);
+
+  WiFi.setPins(WINC_CS,WINC_IRQ,WINC_RST);
+  WiFi.beginAP(AP_SSID,AP_PASS,AP_CHANNEL);
+  httpSrv.begin(); udp.begin(UDP_PORT);
+
+  calibrateBaseline();   // hall baseline
+}
+
+/* ---------- loop ---------- */
+void loop(){
+  unsigned long ms = millis();
+
+  /* ---------- sensor section (unchanged) ---------- */
+  if (ms - lastSampleTimeAnalog >= sampleInterval) {       // IR sample
+    lastSampleTimeAnalog = ms;
+    float v = analogRead(analogPin)*(3.3/1023.0);
+    bool above = v > thresholdVoltage;
+    if(lastAboveThreshold && !above && ms-lastPulseTimeAnalog>debounceMsAnalog){
+      pulseCountAnalog++; lastPulseTimeAnalog = ms;
+    }
+    lastAboveThreshold = above;
+  }
+
+  if (ms - lastMagReadTime >= magReadInterval) {           // Hall update
+    lastMagReadTime = ms; updateMagneticReading();
+  }
+
+  if (ms - lastDisplayTime >= displayInterval) {           // once per second
+    lastDisplayTime = ms;
+
+    float freqAnalog = pulseCountAnalog / 1.0; pulseCountAnalog=0;
+    noInterrupts(); unsigned long pD = pulseCountDigital; pulseCountDigital=0; interrupts();
+    float freqDigital = pD / 1.0;
+
+    MAG = getMagneticStatus();
+    IR_Hz = freqDigital;          // keep same mapping you printed: IR = digital
+    RF_Hz = freqAnalog;           // RADIO = analogue
+  }
+
+  /* ---------- optional UART tag capture ---------- */
+  if(Serial1.available()) uartCapture();
+
+  /* ---------- existing control paths ---------- */
+  handleUDP();
+  handleHTTP();
+}
+
+/* ----------------- UDP ----------------- */
+void handleUDP(){ if(udp.parsePacket()==1) act((char)udp.read()); }
+
+/* ----------------- HTTP ---------------- */
+void handleHTTP() {
+  WiFiClient cli = httpSrv.available();
+  if (!cli) return;
+
+  String req = cli.readStringUntil('\r'); cli.readStringUntil('\n');
+  bool wantJSON = req.startsWith("GET /data");   // <-- new
+
+  char cmd = '\0';
+  int p = req.indexOf("?c=");
+  if (p > 0 && p + 3 < req.length()) cmd = req.charAt(p + 3);
+  while (cli.connected() && cli.readStringUntil('\n') != "\r");
+
+  if (cmd) act(cmd);
+
+  if (wantJSON) {                                // <-- new
+    cli.print(F("HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n\r\n"));
+    cli.print("{\"ir\":");  cli.print(IR_Hz,1);
+    cli.print(",\"rf\":");  cli.print(RF_Hz,1);
+    cli.print(",\"mag\":\""); cli.print(getMagneticStatus()); cli.print("\"");
+    cli.print(",\"tag\":\""); cli.print(TAG); cli.print("\"}");
+  } else {                                       // old path
+    cli.print(F("HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html\r\n"
+                "Connection: close\r\n\r\n"));
+    sendPage(cli);
+  }
+  cli.stop();
+}
+
+
+/* ----------------- act ---------------- */
+void act(char c){
+  switch(c){
+    case 'F': run(255,245); break;
+    case 'B': run(-255,-245); break;
+    case 'L': run(-240,240); break;
+    case 'R': run(240,-240); break;
+    case 'O': digitalWrite(LED_BUILTIN,HIGH); break;
+    case 'o': digitalWrite(LED_BUILTIN,LOW ); break;
+    default : stopMotors();
+  }
+}
+
+/* ----------------- motor helpers ---------------- */
+void setMotor(int dir,int en,int pwm){
+  digitalWrite(dir,pwm>=0); analogWrite(en,abs(pwm));
+}
+void run(int l,int r){ setMotor(DIR_L,EN_L,l); setMotor(DIR_R,EN_R,r);}
+void stopMotors(){ analogWrite(EN_L,0); analogWrite(EN_R,0); }
+
+/* ==================  sensor helpers (verbatim) ================== */
+void countPulseDigital(){
+  unsigned long now=micros();
+  if(now-lastPulseTimeDigital>=debounceUsDigital){
+    pulseCountDigital++; lastPulseTimeDigital=now;
+  }
+}
+
+void calibrateBaseline(){
+  long t=0; for(int i=0;i<100;i++){ t+=analogRead(hallPin); delay(5);}
+  baseline=t/100.0; filteredValue=baseline;
+}
+void updateMagneticReading(){
+  long s=0; for(int i=0;i<sampleCount;i++){ s+=analogRead(hallPin); delay(2);}
+  float avg=s/(float)sampleCount;
+  filteredValue = alpha*avg + (1-alpha)*filteredValue;
+}
+String getMagneticStatus(){
+  float d=(filteredValue-baseline)*gain;
+  if(d> hallThreshold)  return "SOUTH";
+  if(d<-hallThreshold)  return "NORTH";
+  return "NONE";
+}
+
+/* UART tag capture kept minimal */
+void uartCapture(){
+  char d=Serial1.read();
+  if(!collecting){ if(d=='#'){ collecting=true; tagIdx=0; tagBuf[tagIdx++]=d; }}
+  else{
+    if(tagIdx<4) tagBuf[tagIdx++]=d;
+    if(tagIdx==4){ tagBuf[4]='\0'; TAG=String(tagBuf); collecting=false; }
+  }
+}
